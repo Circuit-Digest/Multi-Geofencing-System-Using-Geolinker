@@ -1,0 +1,576 @@
+/*
+ * MultiZoneGeofence.ino
+ * GL868_ESP32 Library — Multi-Zone Geofencing with Cloud Tracking (v14)
+ *
+ * FIX vs v12 (spoof variant):
+ *  [F1] Device showed 12.971600, 77.594600 on boot even though physically
+ *       located at 11.011025384532328, 77.01287015412433.
+ *       Root cause: spoofLat/spoofLon were hardcoded to the OLD v11 Home
+ *       zone coordinates (12.971600, 77.594600). These never got updated
+ *       when the zones[] array was changed to the new coordinate set.
+ *       On every boot, before any Serial input, the device used these
+ *       stale values for geofence checks AND cloud push.
+ *       Fix: initialise spoofLat/spoofLon to the actual current location
+ *       so the device starts exactly where it physically is, with no
+ *       Serial input needed.
+ *
+ * ALL OTHER LOGIC UNCHANGED FROM v12:
+ *  - Raw AT SMS with CRLF line endings
+ *  - GPRS detach/reattach around SMS and calls
+ *  - Non-blocking voice call ticker
+ *  - Manual GPRS attach + custom HTTP POST
+ *  - Zone state persisted to NVS, silent first-fix sync
+ *  - GPS_SPOOF_MODE lets you type "lat,lon" in Serial Monitor to move
+ *    the simulated device for demo/testing purposes
+ */
+
+#include <GL868_ESP32.h>
+#include <math.h>
+#include <Preferences.h>
+
+// ============================================================================
+// Configuration
+// ============================================================================
+#define DEVICE_ID            "Yourdeviceid"
+#define API_KEY              "YourAPIKey"
+#define ALERT_NUMBER         "Yourphnumber"
+
+#define GPS_TIMEOUT          30000UL
+#define GPS_MAX_RETRIES      3
+#define GPS_POLL_INTERVAL    5000UL
+#define CLOUD_SEND_INTERVAL  30          // seconds
+#define GPS_LOSS_ALERT_POLLS 3
+
+#define CALL_RING_DURATION   15000UL
+#define CALL_PENDING_DELAY   3000UL
+
+#define TIME_OFFSET_HOURS    5
+#define TIME_OFFSET_MINS     30
+
+#define HYSTERESIS_METERS    20.0
+#define CIPSHUT_SETTLE_MS    2000UL
+
+#define GPS_SPOOF_MODE
+
+#ifndef DEG_TO_RAD
+  static constexpr double DEG_TO_RAD = M_PI / 180.0;
+#endif
+
+// ============================================================================
+// Geofence zones
+// restricted = false → SMS only on enter/exit
+// restricted = true  → SMS + voice call on enter/exit
+// ============================================================================
+struct GeofenceZone {
+  const char *name;
+  double      latitude;
+  double      longitude;
+  double      radiusMeters;
+  bool        restricted;
+  bool        insideNow;
+};
+
+GeofenceZone zones[] = {
+  { "Home",            11.014144836724832, 77.00262059720626,  150.0,  false,  false },
+  { "College",         11.019563179056176, 77.00693129702604,  200.0,  false,  false },
+  { "Office",          11.010967,          77.012959,          200.0,  false,  false },
+  { "Restricted Area", 11.00497586141225,  77.01513453916289,  100.0,  true,   false },
+};
+
+constexpr int ZONE_COUNT = sizeof(zones) / sizeof(zones[0]);
+static_assert(ZONE_COUNT > 0, "zones[] must not be empty");
+
+// ============================================================================
+// Runtime state
+// ============================================================================
+static Preferences  prefs;
+static uint32_t     lastPollTime     = 0;
+static uint32_t     lastCloudPush    = 0;
+static int          gpsFailStreak    = 0;
+static bool         gpsLossAlertSent = false;
+static bool         gprsAttached     = false;
+
+static bool         callInProgress   = false;
+static uint32_t     callStartTime    = 0;
+static bool         pendingCall      = false;
+static uint32_t     pendingCallTimer = 0;
+
+static bool         firstFixDone     = false;
+
+// ============================================================================
+// Zone state persistence
+// ============================================================================
+static void saveZoneStates() {
+  prefs.begin("gfence", false);
+  for (int i = 0; i < ZONE_COUNT; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "z%d", i);
+    prefs.putBool(key, zones[i].insideNow);
+  }
+  prefs.end();
+}
+
+static void loadZoneStates() {
+  prefs.begin("gfence", true);
+  for (int i = 0; i < ZONE_COUNT; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "z%d", i);
+    zones[i].insideNow = prefs.getBool(key, false);
+  }
+  prefs.end();
+
+  Serial.println("[INIT] Zone states loaded from NVS:");
+  for (int i = 0; i < ZONE_COUNT; i++) {
+    Serial.printf("       %s → %s\n",
+                  zones[i].name,
+                  zones[i].insideNow ? "INSIDE (remembered)" : "outside");
+  }
+}
+
+// ============================================================================
+// GPRS helpers
+// ============================================================================
+static void gprsDetach() {
+  if (!gprsAttached) return;
+  Serial.println("[GPRS] Detaching...");
+  GeoLinker.sendATCommand("+CIPSHUT", 5000);
+  gprsAttached = false;
+  delay(CIPSHUT_SETTLE_MS);
+  Serial.println("[GPRS] Detached.");
+}
+
+static void gprsReattach() {
+  if (gprsAttached) return;
+  Serial.println("[GPRS] Reattaching...");
+  if (GeoLinker.gsm.attachGPRS()) {
+    gprsAttached = true;
+    Serial.println("[GPRS] Attached.");
+  } else {
+    Serial.println("[GPRS] Failed — will retry next push.");
+  }
+}
+
+// ============================================================================
+// Raw SMS (direct AT commands, CRLF line endings)
+// ============================================================================
+static bool sendRawSMS(const char *number, const char *message) {
+  HardwareSerial &mdm = GeoLinker.getModemSerial();
+
+  GeoLinker.sendATCommand("+CMGF=1", 2000);
+  GeoLinker.sendATCommand("+CSCS=\"GSM\"", 2000);
+  delay(200);
+
+  mdm.printf("AT+CMGS=\"%s\"\r", number);
+  Serial.printf("[SMS] AT+CMGS → %s\n", number);
+
+  uint32_t t = millis();
+  bool gotPrompt = false;
+  while (millis() - t < 8000) {
+    if (mdm.available()) {
+      if (mdm.read() == '>') { gotPrompt = true; break; }
+    }
+    delay(10);
+  }
+
+  if (!gotPrompt) {
+    Serial.println("[SMS] No '>' prompt — aborting.");
+    mdm.write(0x1B);
+    return false;
+  }
+
+  for (const char *p = message; *p; p++) {
+    if (*p == '\n' && (p == message || *(p - 1) != '\r')) mdm.write('\r');
+    mdm.write(*p);
+  }
+  mdm.write(0x1A);
+
+  t = millis();
+  while (millis() - t < 30000) {
+    if (mdm.available()) {
+      String line = mdm.readStringUntil('\n');
+      line.trim();
+      if (line.startsWith("+CMGS:")) {
+        Serial.println("[SMS] Delivered.");
+        return true;
+      }
+      if (line.indexOf("ERROR") >= 0) {
+        Serial.printf("[SMS] Error: %s\n", line.c_str());
+        return false;
+      }
+    }
+    delay(10);
+  }
+  Serial.println("[SMS] Timeout waiting for +CMGS.");
+  return false;
+}
+
+static bool sendReliableSMS(const char *number, const char *message) {
+  gprsDetach();
+  bool ok = sendRawSMS(number, message);
+  gprsReattach();
+  return ok;
+}
+
+// ============================================================================
+// Raw voice call
+// ============================================================================
+static bool makeRawCall(const char *number) {
+  HardwareSerial &mdm = GeoLinker.getModemSerial();
+  while (mdm.available()) mdm.read();
+
+  mdm.printf("ATD%s;\r", number);
+  Serial.printf("[CALL] ATD → %s\n", number);
+
+  uint32_t t = millis();
+  while (millis() - t < 5000) {
+    if (mdm.available()) {
+      String line = mdm.readStringUntil('\n');
+      line.trim();
+      if (line == "OK") { Serial.println("[CALL] Ringing."); return true; }
+      if (line.indexOf("ERROR") >= 0 || line.indexOf("NO CARRIER") >= 0) {
+        Serial.printf("[CALL] Rejected: %s\n", line.c_str());
+        return false;
+      }
+    }
+    delay(20);
+  }
+  Serial.println("[CALL] No explicit OK — assuming ringing.");
+  return true;
+}
+
+// ============================================================================
+// Non-blocking call ticker
+// ============================================================================
+static void tickCall() {
+  if (!callInProgress) return;
+  GeoLinker.update();
+  if (millis() - callStartTime >= CALL_RING_DURATION) {
+    GeoLinker.sendATCommand("H", 2000);
+    Serial.println("[CALL] Ring timeout — hung up.");
+    callInProgress = false;
+    delay(500);
+    gprsReattach();
+  }
+}
+
+// ============================================================================
+// Haversine distance
+// ============================================================================
+static double haversineDistance(double lat1, double lon1,
+                                double lat2, double lon2) {
+  const double R = 6371000.0;
+  double dLat = (lat2 - lat1) * DEG_TO_RAD;
+  double dLon = (lon2 - lon1) * DEG_TO_RAD;
+  double a = sin(dLat / 2) * sin(dLat / 2) +
+             cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD) *
+             sin(dLon / 2) * sin(dLon / 2);
+  return R * 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+}
+
+static void sanitiseForSMS(char *dst, int dstLen, const char *src) {
+  int j = 0;
+  for (int i = 0; src[i] && j < dstLen - 1; i++) {
+    char c = src[i];
+    if (c == '\r') continue;
+    if (c == '"')  { dst[j++] = '\''; continue; }
+    dst[j++] = c;
+  }
+  dst[j] = '\0';
+}
+
+// ============================================================================
+// SMS body builder
+// ============================================================================
+static void buildAlertMessage(char *buf, int bufLen,
+                              const char *verb, const char *zoneName,
+                              GPSData *gps, bool hasLoc) {
+  char safe[64];
+  sanitiseForSMS(safe, sizeof(safe), zoneName);
+  int bat = GeoLinker.getBatteryPercent();
+
+  if (hasLoc) {
+    snprintf(buf, bufLen,
+             "%s %s\n%.6f,%.6f\nSpd:%.1f Bat:%d%%\nmaps.google.com/?q=%.6f,%.6f",
+             verb, safe,
+             gps->latitude, gps->longitude,
+             gps->speed, bat,
+             gps->latitude, gps->longitude);
+  } else {
+    snprintf(buf, bufLen, "%s %s\nNo GPS fix\nBat:%d%%", verb, safe, bat);
+  }
+}
+
+// ============================================================================
+// Geofence alert dispatcher
+// ============================================================================
+static void sendGeofenceAlert(const char *zoneName, bool entered,
+                              bool restricted, GPSData *gps, bool hasLoc) {
+  const char *verb = entered ? "ENTERED" : "LEFT";
+  Serial.printf("[ALERT] %s %s  restricted:%s\n",
+                verb, zoneName, restricted ? "YES" : "NO");
+
+  char msg[256];
+  buildAlertMessage(msg, sizeof(msg), verb, zoneName, gps, hasLoc);
+  sendReliableSMS(ALERT_NUMBER, msg);
+
+  if (restricted && !callInProgress && !pendingCall) {
+    Serial.println("[ALERT] Scheduling voice call in 3 s...");
+    pendingCall      = true;
+    pendingCallTimer = millis();
+  }
+}
+
+// ============================================================================
+// GPS-loss alert
+// ============================================================================
+static void sendGPSLossAlert() {
+  char msg[160];
+  snprintf(msg, sizeof(msg),
+           "GPS Loss!\nDevice:%s\nFailed:%d polls\nBat:%d%%",
+           DEVICE_ID, gpsFailStreak, GeoLinker.getBatteryPercent());
+  Serial.println("[GPS] Sending GPS-loss SMS...");
+  sendReliableSMS(ALERT_NUMBER, msg);
+}
+
+// ============================================================================
+// [F1] GPS spoof — initialised to the ACTUAL physical location
+// ============================================================================
+#ifdef GPS_SPOOF_MODE
+static double spoofLat = 11.011025384532328;
+static double spoofLon = 77.01287015412433;
+
+static void checkSpoofInput() {
+  if (!Serial.available()) return;
+
+  String s = Serial.readStringUntil('\n');
+  s.trim();
+
+  int comma = s.indexOf(',');
+  if (comma < 0) return;
+
+  double lat = s.substring(0, comma).toDouble();
+  double lon = s.substring(comma + 1).toDouble();
+
+  if (lat != 0.0 && lon != 0.0) {
+    spoofLat = lat;
+    spoofLon = lon;
+    Serial.printf("[SPOOF] Moved to %.6f, %.6f\n", spoofLat, spoofLon);
+  }
+}
+
+static bool getValidLocation(GPSData *gps) {
+  checkSpoofInput();
+
+  gps->latitude   = spoofLat;
+  gps->longitude  = spoofLon;
+  gps->speed      = 0.0;
+  gps->satellites = 6;
+  gps->valid      = true;
+
+  uint32_t s  = millis() / 1000UL;
+  uint32_t hh = (s / 3600UL) % 24UL;
+  uint32_t mm = (s /   60UL) % 60UL;
+  uint32_t ss =  s            % 60UL;
+  snprintf(gps->timestamp, sizeof(gps->timestamp),
+           "2025-01-01 %02lu:%02lu:%02lu", hh, mm, ss);
+
+  return true;
+}
+#endif
+
+// ============================================================================
+// Geofence checker
+// ============================================================================
+static void checkGeofences(GPSData *gps, bool hasLoc) {
+  if (!hasLoc) { Serial.println("[FENCE] No fix — skipping."); return; }
+
+  bool stateChanged = false;
+
+  for (int i = 0; i < ZONE_COUNT; i++) {
+    double dist        = haversineDistance(gps->latitude, gps->longitude,
+                                           zones[i].latitude, zones[i].longitude);
+    double enterThresh = zones[i].radiusMeters;
+    double exitThresh  = zones[i].radiusMeters + HYSTERESIS_METERS;
+
+    bool nowInside = zones[i].insideNow ? (dist <= exitThresh)
+                                        : (dist <= enterThresh);
+
+    Serial.printf("[FENCE] %-18s | %7.1f m | enter:%.0f exit:%.0f | %-7s | %s\n",
+                  zones[i].name, dist, enterThresh, exitThresh,
+                  nowInside ? "INSIDE" : "outside",
+                  zones[i].restricted ? "RESTRICTED" : "normal");
+
+    if (nowInside != zones[i].insideNow) {
+      zones[i].insideNow = nowInside;
+      stateChanged = true;
+
+      if (!firstFixDone) {
+        Serial.printf("[FENCE] (silent sync) %s → %s\n",
+                      zones[i].name, nowInside ? "inside" : "outside");
+      } else {
+        sendGeofenceAlert(zones[i].name, nowInside,
+                          zones[i].restricted, gps, hasLoc);
+      }
+    }
+  }
+
+  if (stateChanged) saveZoneStates();
+
+  if (!firstFixDone) {
+    firstFixDone = true;
+    Serial.println("[FENCE] First-fix sync complete — alerts now armed.");
+  }
+}
+
+// ============================================================================
+// Cloud push
+// ============================================================================
+static void cloudPush(GPSData *gps, bool hasLoc) {
+  if (!gprsAttached) { gprsReattach(); if (!gprsAttached) return; }
+
+  GeoLinker.json.clear();
+  const GPSData &src = hasLoc ? *gps : GeoLinker.getLastGPS();
+  GeoLinker.json.addDataPoint(src,
+                              GeoLinker.getBatteryPercent(),
+                              GeoLinker.getSignalStrength());
+  char payload[1024];
+  if (!GeoLinker.json.build(payload, sizeof(payload))) {
+    Serial.println("[CLOUD] JSON build failed."); return;
+  }
+
+  Serial.printf("[CLOUD] Push: %.6f, %.6f  Bat:%d%%\n",
+                src.latitude, src.longitude, GeoLinker.getBatteryPercent());
+
+  int code = GeoLinker.gsm.httpPOST(
+               "http://www.circuitdigest.cloud/api/v1/geolinker",
+               API_KEY, "application/json", payload);
+
+  Serial.printf("[CLOUD] HTTP %d\n", code);
+  if (code == -1) {
+    Serial.println("[CLOUD] Failed — will reattach next push.");
+    gprsAttached = false;
+  }
+}
+
+// ============================================================================
+// setup()
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("==============================================");
+  Serial.println(" Multi-Zone Geofencing  GL868_ESP32 (v14)");
+  Serial.println("==============================================");
+
+  loadZoneStates();
+
+  GeoLinker.setOperatingMode(MODE_SMS_CALL);
+  GeoLinker.setTimeOffset(TIME_OFFSET_HOURS, TIME_OFFSET_MINS);
+  GeoLinker.enableFullPowerOff(false);
+  GeoLinker.begin(DEVICE_ID, API_KEY);
+
+  Serial.println("[INIT] Waiting for modem IDLE...");
+  {
+    uint32_t t = millis();
+    while (GeoLinker.getState() != STATE_IDLE && millis() - t < 50000UL) {
+      GeoLinker.update(); delay(100);
+    }
+    Serial.printf("[INIT] Modem ready (%lu ms)\n", millis() - t);
+  }
+
+  Serial.println("[INIT] Attaching GPRS...");
+  if (GeoLinker.gsm.attachGPRS()) {
+    gprsAttached = true;
+    Serial.println("[INIT] GPRS attached.");
+  } else {
+    Serial.println("[INIT] GPRS failed — retrying on first push.");
+  }
+
+  GeoLinker.gpsOn();
+  Serial.println("[GPS] GPS powered on.");
+
+  Serial.println("\nConfigured Zones:");
+  Serial.println("  #  Name               Lat         Lon        Radius   Alert     Inside?");
+  Serial.println("  -- ------------------ ----------- ---------- -------- --------- -------");
+  for (int i = 0; i < ZONE_COUNT; i++) {
+    Serial.printf("  %d  %-18s %.6f  %.6f  %.0f m    %-9s %s\n",
+                  i + 1, zones[i].name,
+                  zones[i].latitude, zones[i].longitude,
+                  zones[i].radiusMeters,
+                  zones[i].restricted ? "SMS+CALL" : "SMS only",
+                  zones[i].insideNow  ? "YES (remembered)" : "no");
+  }
+  Serial.printf("\nAlert number  : %s\n", ALERT_NUMBER);
+  Serial.printf("Poll interval : %lu ms\n", GPS_POLL_INTERVAL);
+  Serial.printf("Cloud interval: %d s\n", CLOUD_SEND_INTERVAL);
+#ifdef GPS_SPOOF_MODE
+  Serial.printf("Spoof start   : %.6f, %.6f (your real location)\n\n", spoofLat, spoofLon);
+#endif
+  Serial.println("Monitoring started.\n");
+
+  lastPollTime  = millis();
+  lastCloudPush = millis();
+}
+
+// ============================================================================
+// loop()
+// ============================================================================
+void loop() {
+  GeoLinker.update();
+#ifdef GPS_SPOOF_MODE
+  checkSpoofInput();
+#endif
+
+  if (pendingCall && (millis() - pendingCallTimer >= CALL_PENDING_DELAY)) {
+    if (!callInProgress) {
+      gprsDetach();
+      Serial.println("[CALL] Initiating voice call...");
+      if (makeRawCall(ALERT_NUMBER)) {
+        callInProgress = true;
+        callStartTime  = millis();
+      } else {
+        Serial.println("[CALL] Dial failed — reattaching GPRS.");
+        gprsReattach();
+      }
+      pendingCall = false;
+    }
+  }
+
+  tickCall();
+
+  if (millis() - lastPollTime < GPS_POLL_INTERVAL) return;
+  lastPollTime = millis();
+
+  if (callInProgress) {
+    Serial.println("[LOOP] Call in progress — skipping poll.");
+    return;
+  }
+
+  GPSData gps = {};
+  bool hasLoc = getValidLocation(&gps);
+
+  if (hasLoc) {
+    if (gpsFailStreak > 0)
+      Serial.printf("[GPS] Restored after %d failure(s).\n", gpsFailStreak);
+    gpsFailStreak    = 0;
+    gpsLossAlertSent = false;
+  } else {
+    gpsFailStreak++;
+    Serial.printf("[GPS] Failure %d/%d\n", gpsFailStreak, GPS_LOSS_ALERT_POLLS);
+    if (gpsFailStreak >= GPS_LOSS_ALERT_POLLS && !gpsLossAlertSent) {
+      sendGPSLossAlert();
+      gpsLossAlertSent = true;
+    }
+  }
+
+  checkGeofences(&gps, hasLoc);
+
+  if (!pendingCall && !callInProgress &&
+      millis() - lastCloudPush >= (uint32_t)CLOUD_SEND_INTERVAL * 1000UL) {
+    lastCloudPush = millis();
+    cloudPush(&gps, hasLoc);
+  }
+
+  Serial.printf("[LOOP] Done. Next in %lu ms\n\n", GPS_POLL_INTERVAL);
+}
