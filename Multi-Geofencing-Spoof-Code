@@ -1,29 +1,3 @@
-/*
- * MultiZoneGeofence.ino
- * GL868_ESP32 Library — Multi-Zone Geofencing with Cloud Tracking (v14)
- *
- * FIX vs v12 (spoof variant):
- *  [F1] Device showed 12.971600, 77.594600 on boot even though physically
- *       located at 11.011025384532328, 77.01287015412433.
- *       Root cause: spoofLat/spoofLon were hardcoded to the OLD v11 Home
- *       zone coordinates (12.971600, 77.594600). These never got updated
- *       when the zones[] array was changed to the new coordinate set.
- *       On every boot, before any Serial input, the device used these
- *       stale values for geofence checks AND cloud push.
- *       Fix: initialise spoofLat/spoofLon to the actual current location
- *       so the device starts exactly where it physically is, with no
- *       Serial input needed.
- *
- * ALL OTHER LOGIC UNCHANGED FROM v12:
- *  - Raw AT SMS with CRLF line endings
- *  - GPRS detach/reattach around SMS and calls
- *  - Non-blocking voice call ticker
- *  - Manual GPRS attach + custom HTTP POST
- *  - Zone state persisted to NVS, silent first-fix sync
- *  - GPS_SPOOF_MODE lets you type "lat,lon" in Serial Monitor to move
- *    the simulated device for demo/testing purposes
- */
-
 #include <GL868_ESP32.h>
 #include <math.h>
 #include <Preferences.h>
@@ -31,9 +5,9 @@
 // ============================================================================
 // Configuration
 // ============================================================================
-#define DEVICE_ID            "Yourdeviceid"
-#define API_KEY              "YourAPIKey"
-#define ALERT_NUMBER         "Yourphnumber"
+#define DEVICE_ID            "yourdeviceid"
+#define API_KEY              "yourapikey"
+#define ALERT_NUMBER         "yourphonenumber"
 
 #define GPS_TIMEOUT          30000UL
 #define GPS_MAX_RETRIES      3
